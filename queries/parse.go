@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -63,8 +64,9 @@ func InjectMatcher(q url.Values, matcher *labels.Matcher) error {
 	return nil
 }
 
-func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key string, authKey string, defaultValue string) (string, error) {
+func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key string, authKey string, defaultValue string) (string, labels.MatchType, error) {
 	value := defaultValue
+	matchType := labels.MatchEqual
 	expr, exprErr := parser.ParseExpr(queryValues[QueryParam][0])
 	matchers := parser.ExtractSelectors(expr)
 	if exprErr != nil {
@@ -74,6 +76,7 @@ func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key st
 		for _, matcherSelector := range matcherSelector {
 			if matcherSelector.Name == key {
 				value = matcherSelector.Value
+				matchType = matcherSelector.Type
 			}
 		}
 	}
@@ -81,45 +84,102 @@ func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key st
 	if value != "" {
 		matcher := &labels.Matcher{
 			Name:  authKey,
-			Type:  labels.MatchRegexp,
+			Type:  matchType,
 			Value: LabelValuesToRegexpString([]string{value}),
 		}
 		err := InjectMatcher(queryValuesForAuth, matcher)
-		return value, err
+		return value, matchType, err
 	}
-	return value, nil
+	return value, matchType, nil
 }
 
-func ParseAuthorizations(hubKey string, clusterKey string, projectKey string, hub string, queryValues url.Values) (url.Values, []string, []string) {
-	queryValuesForAuth := make(url.Values)
+func findMatcherFromName(matchers []*labels.Matcher, name string) (*labels.Matcher) {
+	matcherIndex := slices.IndexFunc(matchers, func(m *labels.Matcher) (bool) {
+		return m.Name == name
+	})
+	if matcherIndex == -1 {
+		return nil
+	}
+	return matchers[matcherIndex]
+}
 
-	var authResourceNames []string
-	var authScopeNames []string
+func ParseAuthorizations(hubKey string, clusterKey string, projectKey string, hub string, matchers []*labels.Matcher) (string) {
+	resourceName := fmt.Sprintf("%s-%s", hubKey, hub)
 
-	authResourceNames = append(authResourceNames, hubKey)
-	authScopeNames = append(authScopeNames, "GET")
+	matcher := findMatcherFromName(matchers, "cluster")
+	if matcher.Value != "" {
+		if matcher.Type == labels.MatchRegexp {
+			resourceName = fmt.Sprintf("%s-%s-(%s)", resourceName, clusterKey, matcher.Value)
+		} else {
+			resourceName = fmt.Sprintf("%s-%s-%s", resourceName, clusterKey, matcher.Value)
+		}
 
-	authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s", hubKey, hub))
-	authScopeNames = append(authScopeNames, "GET")
+		exportedNamespaceMatcher := findMatcherFromName(matchers, "exported_namespace")
+		namespaceMatcher := findMatcherFromName(matchers, "namespace")
+		if exportedNamespaceMatcher == nil && namespaceMatcher == nil {
+			return resourceName
+		}
 
-	cluster, _ := AppendMatcher(queryValues, queryValuesForAuth, "cluster", fmt.Sprintf("%s-%s-%s", hubKey, hub, clusterKey), "")
-
-	if cluster != "" {
-		authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s", hubKey, hub, clusterKey, cluster))
-		authScopeNames = append(authScopeNames, "GET")
-
-		exported_namespace, _ := AppendMatcher(queryValues, queryValuesForAuth, "exported_namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey), "")
-		namespace, _ := AppendMatcher(queryValues, queryValuesForAuth, "namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey), exported_namespace)
-
-		if namespace != "" {
-			if cluster != "" {
-				authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey, namespace))
-				authScopeNames = append(authScopeNames, "GET")
+		exportedNamespaceValue := "$^"
+		if exportedNamespaceMatcher != nil && exportedNamespaceMatcher.Value != "" {
+			if exportedNamespaceMatcher.Type == labels.MatchEqual {
+				exportedNamespaceValue = regexp.QuoteMeta(exportedNamespaceMatcher.Value)
+			} else {
+				exportedNamespaceValue = exportedNamespaceMatcher.Value
 			}
+		}
+
+		namespaceValue := "$^"
+		if namespaceMatcher != nil && namespaceMatcher.Value != "" {
+			if namespaceMatcher.Type == labels.MatchEqual {
+				namespaceValue = regexp.QuoteMeta(namespaceMatcher.Value)
+			} else {
+				namespaceValue = namespaceMatcher.Value
+			}
+		}
+
+		resourceName = fmt.Sprintf("%s-%s-(%s|%s)$", resourceName, projectKey, exportedNamespaceValue, namespaceValue)
+	}
+
+	return resourceName
+}
+
+func PromqlQueryFromResourceNames(metric string, resourceNames []string, hubKey string, clusterKey string, projectKey string) (string) {
+	clusters := make([]*string, len(resourceNames))
+	namespaces := make([]*string, len(resourceNames))
+
+	for i, _ := range resourceNames {
+		clusters[i] = nil
+		namespaces[i] = nil
+
+		re := regexp.MustCompile(fmt.Sprintf("^%s-([\\w-]+)-%s-([\\w-]+)-%s-([\\w-]+)$", hubKey, clusterKey, projectKey))
+		if matches := re.FindStringSubmatch(resourceNames[i]); matches != nil {
+			clusters[i] = &matches[2]
+			namespaces[i] = &matches[3]
+			continue
+		}
+
+		re = regexp.MustCompile(fmt.Sprintf("^%s-([\\w-]+)-%s-([\\w-]+)$", hubKey, clusterKey))
+		if matches := re.FindStringSubmatch(resourceNames[i]); matches != nil {
+			clusters[i] = &matches[2]
+			continue
 		}
 	}
 
-	return queryValuesForAuth, authResourceNames, authScopeNames
+	queries := make([]string, len(resourceNames))
+	for i := 0; i < len(resourceNames); i++ {
+		if clusters[i] != nil && namespaces != nil {
+			queries[i] = fmt.Sprintf("%s{cluster=\"%s\",namespace=\"%s\"}", metric, *clusters[i], *namespaces[i])
+		} else if clusters[i] != nil {
+			queries[i] = fmt.Sprintf("%s{cluster=\"%s\"}", metric, *clusters[i])
+		} else if namespaces[i] != nil {
+			queries[i] = fmt.Sprintf("%s{namespace=\"%s\"}", metric, *namespaces[i])
+		} else {
+			queries[i] = metric
+		}
+	}
+
+	return strings.Join(queries, " or ")
 }
 
 func QueryPrometheus(prometheusTlsCertPath string, prometheusTlsKeyPath string,

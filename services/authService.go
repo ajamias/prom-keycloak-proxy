@@ -7,13 +7,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/OCP-on-NERC/prom-keycloak-proxy/errors"
 	"github.com/OCP-on-NERC/prom-keycloak-proxy/queries"
+
+	"github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/Nerzal/gocloak/v13"
 	_ "github.com/gorilla/mux"
@@ -81,6 +83,7 @@ func Protect(hubKey string, clusterKey string, projectKey string, gocloakClient 
 			json.NewEncoder(w).Encode(errors.BadRequestError(err.Error())) //nolint:errcheck
 			return
 		}
+
 		username := *userInfo.PreferredUsername
 		var userClientId = ""
 		if strings.Contains(username, "service-account-") {
@@ -88,7 +91,6 @@ func Protect(hubKey string, clusterKey string, projectKey string, gocloakClient 
 		}
 
 		isTokenValid := *rptResult.Active
-
 		if !isTokenValid {
 			log.Warn().
 				Int("status", 401).
@@ -106,12 +108,26 @@ func Protect(hubKey string, clusterKey string, projectKey string, gocloakClient 
 		}
 
 		queryValues := r.URL.Query()
-		_, authResourceNames, authResourceScopes := queries.ParseAuthorizations(hubKey, clusterKey, projectKey, proxyAcmHub, queryValues)
-		var permissions []string
+		matchers, err := parser.ParseMetricSelector(r.URL.Query()["query"][0])
+		if err != nil {
+			log.Panic()
+		}
+		resourceName := queries.ParseAuthorizations(hubKey, clusterKey, projectKey, proxyAcmHub, matchers)
+		re, err := regexp.Compile(resourceName)
+		if err != nil {
+			log.Warn().
+				Int("status", 400).
+				Str("method", r.Method).
+				Str("path", r.RequestURI).
+				Str("ip", r.RemoteAddr).
+				Str("username", username).
+				Str("client-id", userClientId).
+				Str("query", query).
+				Msg("Bad Request")
 
-		for index, authResourceName := range authResourceNames {
-			authScopeName := authResourceScopes[index]
-			permissions = append(permissions, fmt.Sprintf("%s#%s", authResourceName, authScopeName))
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(errors.BadRequestError(err.Error()))
+			return
 		}
 
 		rpp, err := gocloakClient.GetRequestingPartyPermissions(
@@ -120,10 +136,8 @@ func Protect(hubKey string, clusterKey string, projectKey string, gocloakClient 
 			authRealm,
 			gocloak.RequestingPartyTokenOptions{
 				Audience:    gocloak.StringP(authClientId),
-				Permissions: &permissions,
 			},
 		)
-
 		if err != nil {
 			log.Warn().
 				Int("status", 403).
@@ -157,54 +171,36 @@ func Protect(hubKey string, clusterKey string, projectKey string, gocloakClient 
 			return
 		}
 
-		var final_result = true
-		var unauthorized_key = ""
-		var unauthorized_value = ""
-		var current_result = false
-		for i, key := range authResourceNames {
-			value := authResourceScopes[i]
-			for _, permission := range *rpp {
-				if key == *permission.ResourceName && slices.Contains(*permission.Scopes, value) {
-					current_result = true
-					break
-				}
-			}
-			if !current_result {
-				unauthorized_key = key
-				unauthorized_value = value
+		// for all permissions associated with the token, if it matches the regex, add it to URL.values
+		// get a label.matcher from a ResourceName
+		var metricName string
+		for _, matcher := range matchers {
+			if matcher.Name == "__name__" {
+				metricName = matcher.Value
+				break
 			}
 		}
-		if !current_result {
-			final_result = false
+		var authorizedResourceNames []string
+		for _, permission := range *rpp {
+			if slices.Contains(*permission.Scopes, "GET") && re.MatchString(*permission.ResourceName) {
+				authorizedResourceNames = append(authorizedResourceNames, *permission.ResourceName)
+			}
 		}
 
-		if final_result {
-			log.Info().
-				Int("status", 200).
-				Str("method", r.Method).
-				Str("path", r.RequestURI).
-				Str("ip", r.RemoteAddr).
-				Str("username", username).
-				Str("client-id", userClientId).
-				Str("query", query).
-				RawJSON("permissions", out).
-				Msg("OK")
-		} else {
-			message := "You are not authorized to access the resource \"" + unauthorized_key + "\" with scope \"" + unauthorized_value + "\""
-			log.Warn().
-				Int("status", 403).
-				Str("method", r.Method).
-				Str("path", r.RequestURI).
-				Str("ip", r.RemoteAddr).
-				Str("username", username).
-				Str("client-id", userClientId).
-				Str("query", query).
-				Msg(message)
+		newQuery := queries.PromqlQueryFromResourceNames(metricName, authorizedResourceNames, hubKey, clusterKey, projectKey)
+		queryValues.Set("query", newQuery)
+		r.URL.RawQuery = queryValues.Encode()
 
-			w.WriteHeader(403)
-			json.NewEncoder(w).Encode(errors.HttpError{Code: 403, Error: "Forbidden", Message: message}) //nolint:errcheck
-			return
-		}
+		log.Info().
+			Int("status", 200).
+			Str("method", r.Method).
+			Str("path", r.RequestURI).
+			Str("ip", r.RemoteAddr).
+			Str("username", username).
+			Str("client-id", userClientId).
+			Str("query", query).
+			RawJSON("permissions", out).
+			Msg("OK")
 
 		// Our middleware logic goes here...
 		next.ServeHTTP(w, r)
